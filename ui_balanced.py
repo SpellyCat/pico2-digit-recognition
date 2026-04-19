@@ -1,10 +1,11 @@
 import tkinter as tk
 from tkinter import messagebox
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import serial
 import json
 import threading
 import time
+import numpy as np
 
 PICO_PORT = 'COM8'
 BAUD_RATE = 115200
@@ -62,13 +63,52 @@ class DistributedDigitApp:
         self.draw = ImageDraw.Draw(self.image)
         self.result_label.config(text="已清空，请重新写字")
 
+    def _center_of_mass(self, arr):
+        total = float(arr.sum())
+        if total <= 1e-8:
+            return None
+        ys, xs = np.indices(arr.shape)
+        cx = float((xs * arr).sum() / total)
+        cy = float((ys * arr).sum() / total)
+        return cx, cy
+
+    def _deskew(self, img):
+        arr = np.asarray(img, dtype=np.float32)
+        com = self._center_of_mass(arr)
+        if com is None:
+            return img
+
+        cx, cy = com
+        ys, xs = np.indices(arr.shape)
+        total = float(arr.sum())
+        mu02 = float((((ys - cy) ** 2) * arr).sum() / total)
+        mu11 = float((((xs - cx) * (ys - cy)) * arr).sum() / total)
+        if mu02 <= 1e-6:
+            return img
+
+        skew = mu11 / mu02
+        matrix = (1.0, -skew, skew * cy, 0.0, 1.0, 0.0)
+        return img.transform(img.size, Image.Transform.AFFINE, matrix, resample=Image.Resampling.BICUBIC)
+
+    def _shift_center(self, img):
+        arr = np.asarray(img, dtype=np.float32)
+        com = self._center_of_mass(arr)
+        if com is None:
+            return img
+
+        cx, cy = com
+        dx = (img.width - 1) / 2.0 - cx
+        dy = (img.height - 1) / 2.0 - cy
+        matrix = (1.0, 0.0, -dx, 0.0, 1.0, -dy)
+        return img.transform(img.size, Image.Transform.AFFINE, matrix, resample=Image.Resampling.BICUBIC)
+
     def build_features(self):
         bbox = self.image.getbbox()
         if bbox is None:
             return None
 
         left, top, right, bottom = bbox
-        pad = 16
+        pad = 22
         left = max(0, left - pad)
         top = max(0, top - pad)
         right = min(self.image.width, right + pad)
@@ -82,7 +122,11 @@ class DistributedDigitApp:
         offset = ((side - w) // 2, (side - h) // 2)
         square.paste(crop, offset)
 
+        square = self._deskew(square)
+        square = self._shift_center(square)
+        square = square.filter(ImageFilter.GaussianBlur(radius=0.35))
         img_resized = square.resize((8, 8), Image.Resampling.LANCZOS)
+
         return [round((p / 255.0) * 16.0, 4) for p in img_resized.getdata()]
 
     def send_data(self):

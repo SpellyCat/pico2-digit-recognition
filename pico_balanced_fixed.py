@@ -24,7 +24,16 @@ def blink_led():
 
 
 def tanh(x):
-    return math.tanh(x)
+    if x > 8.0:
+        return 1.0
+    if x < -8.0:
+        return -1.0
+    e_pos = math.exp(x)
+    e_neg = math.exp(-x)
+    denom = e_pos + e_neg
+    if denom == 0.0:
+        return 0.0
+    return (e_pos - e_neg) / denom
 
 
 def softmax(logits):
