@@ -1,187 +1,171 @@
 from __future__ import annotations
 
 from pathlib import Path
-import warnings
+import json
+import math
+from typing import Tuple
+
 import numpy as np
-from scipy.ndimage import affine_transform, shift as ndi_shift
-from sklearn.datasets import load_digits
-from sklearn.metrics import accuracy_score
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-warnings.filterwarnings("ignore")
-
 RANDOM_STATE = 42
-HIDDEN_UNITS = 40
-N_AUG = 5
-DECIMALS = 1
-ALPHA = 0.0001
-LEARNING_RATE = 0.0013
-MAX_ITER = 450
+PCA_COMPONENTS = 64
+HIDDEN_UNITS = 64
+MAX_ITER = 45
+ALPHA = 1e-4
+LEARNING_RATE_INIT = 0.001
+BATCH_SIZE = 256
+LOGIT_SCALE_GRID = np.linspace(0.60, 2.50, 39)
+OUTPUT_MODEL = Path(__file__).with_name("pico_mnist_model.json")
 
 
-def preprocess(img: np.ndarray) -> np.ndarray:
-    img = np.array(img, dtype=float)
-    img = np.clip(img, 0.0, None)
-
-    total = float(img.sum())
-    if total <= 1e-8:
-        return img
-
-    ys, xs = np.indices(img.shape)
-    cx = float((xs * img).sum() / total)
-    cy = float((ys * img).sum() / total)
-
-    dx = (img.shape[1] - 1) / 2.0 - cx
-    dy = (img.shape[0] - 1) / 2.0 - cy
-    img = ndi_shift(img, shift=(dy, dx), order=1, mode="constant", cval=0.0)
-
-    total = float(img.sum())
-    if total > 1e-8:
-        ys, xs = np.indices(img.shape)
-        cx = float((xs * img).sum() / total)
-        cy = float((ys * img).sum() / total)
-        mu02 = float((((ys - cy) ** 2) * img).sum() / total)
-        mu11 = float((((xs - cx) * (ys - cy)) * img).sum() / total)
-        if mu02 > 1e-6:
-            skew = mu11 / mu02
-            mat = np.array([[1.0, 0.0], [-skew, 1.0]], dtype=float)
-            offset = np.array([0.0, skew * cy], dtype=float)
-            img = affine_transform(img, mat, offset=offset, order=1, mode="constant", cval=0.0)
-
-    mx = float(img.max())
-    if mx > 0:
-        img = img / mx * 16.0
-    return img
+def load_mnist() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    try:
+        from tensorflow.keras.datasets import mnist
+        (x_train, y_train), (x_test, y_test) = mnist.load_data()
+        x_train = x_train.astype(np.float32) / 255.0
+        x_test = x_test.astype(np.float32) / 255.0
+        y_train = y_train.astype(np.int64)
+        y_test = y_test.astype(np.int64)
+        return x_train, y_train, x_test, y_test
+    except Exception:
+        from sklearn.datasets import fetch_openml
+        mnist = fetch_openml("mnist_784", version=1, as_frame=False, parser="auto")
+        x = mnist.data.astype(np.float32) / 255.0
+        y = mnist.target.astype(np.int64)
+        x = x.reshape(-1, 28, 28)
+        return x[:60000], y[:60000], x[60000:], y[60000:]
 
 
-def augment(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    sx = rng.uniform(-1.3, 1.3)
-    sy = rng.uniform(-1.3, 1.3)
-    ang = rng.uniform(-20, 20)
-    shear = rng.uniform(-0.35, 0.35)
-
-    theta = np.deg2rad(ang)
-    c, s = np.cos(theta), np.sin(theta)
-    rot = np.array([[c, -s], [s, c]], dtype=float)
-    sh = np.array([[1.0, shear], [0.0, 1.0]], dtype=float)
-    mat = rot @ sh
-    inv = np.linalg.inv(mat)
-
-    center = np.array(img.shape) / 2.0 - 0.5
-    offset = center - inv @ center - np.array([sy, sx], dtype=float)
-    out = affine_transform(img, inv, offset=offset, order=1, mode="constant", cval=0.0, output_shape=img.shape)
-    return out
+def fit_pca_and_scaler(x_train_flat: np.ndarray) -> tuple[PCA, StandardScaler]:
+    pca = PCA(n_components=PCA_COMPONENTS, svd_solver="randomized", whiten=False, random_state=RANDOM_STATE)
+    train_pca = pca.fit_transform(x_train_flat)
+    scaler = StandardScaler()
+    scaler.fit(train_pca)
+    return pca, scaler
 
 
-def make_augmented(X: np.ndarray, y: np.ndarray, n_aug: int = N_AUG, seed: int = 0):
-    rng = np.random.default_rng(seed)
-    imgs = []
-    labels = []
-    for img, label in zip(X, y):
-        imgs.append(preprocess(img))
-        labels.append(label)
-        for _ in range(n_aug):
-            imgs.append(preprocess(augment(img, rng)))
-            labels.append(label)
-    return np.array(imgs), np.array(labels)
+def transform_features(pca: PCA, scaler: StandardScaler, x_flat: np.ndarray) -> np.ndarray:
+    return scaler.transform(pca.transform(x_flat))
 
 
-def fmt(v: float) -> str:
-    return f"{float(v):.{DECIMALS}f}"
+def train_mlp(x_train: np.ndarray, y_train: np.ndarray) -> MLPClassifier:
+    model = MLPClassifier(
+        hidden_layer_sizes=(HIDDEN_UNITS,), activation="relu", solver="adam",
+        alpha=ALPHA, batch_size=BATCH_SIZE, learning_rate_init=LEARNING_RATE_INIT,
+        max_iter=MAX_ITER, random_state=RANDOM_STATE, early_stopping=True,
+        validation_fraction=0.1, n_iter_no_change=8, tol=1e-4, verbose=False,
+    )
+    model.fit(x_train, y_train)
+    return model
 
 
-def write_vector(f, name, vec):
-    f.write(f"{name} = [\n")
-    f.write("    " + ", ".join(fmt(v) for v in vec) + "\n")
-    f.write("]\n\n")
+def quantize_matrix(mat: np.ndarray) -> tuple[np.ndarray, float]:
+    mat = np.asarray(mat, dtype=np.float64)
+    max_abs = float(np.max(np.abs(mat)))
+    if max_abs == 0.0:
+        return np.zeros_like(mat, dtype=np.int16), 1.0
+    scale = max_abs / 127.0
+    q = np.clip(np.rint(mat / scale), -127, 127).astype(np.int16)
+    return q, scale
 
 
-def write_matrix(f, name, mat):
-    f.write(f"{name} = [\n")
-    for row in mat:
-        f.write("    [" + ", ".join(fmt(v) for v in row) + "],\n")
-    f.write("]\n\n")
+def forward_quantized(x: np.ndarray, w1: np.ndarray, b1: np.ndarray, s1: float,
+                      w2: np.ndarray, b2: np.ndarray, s2: float, logit_scale: float = 1.0) -> np.ndarray:
+    hidden = np.maximum(0.0, b1 + s1 * (x @ w1.T))
+    logits = b2 + s2 * (hidden @ w2.T)
+    return logits * logit_scale
 
 
-def export_model(path: Path, scaler: StandardScaler, mlp: MLPClassifier) -> None:
+def predict_quantized(x: np.ndarray, w1: np.ndarray, b1: np.ndarray, s1: float,
+                      w2: np.ndarray, b2: np.ndarray, s2: float, logit_scale: float = 1.0) -> np.ndarray:
+    return np.argmax(forward_quantized(x, w1, b1, s1, w2, b2, s2, logit_scale), axis=1)
+
+
+def softmax_nll(logits: np.ndarray, y_true: np.ndarray) -> float:
+    logits = logits - logits.max(axis=1, keepdims=True)
+    exp = np.exp(logits)
+    probs = exp / exp.sum(axis=1, keepdims=True)
+    return log_loss(y_true, probs, labels=list(range(10)))
+
+
+def tune_logit_scale(x_val: np.ndarray, y_val: np.ndarray, w1: np.ndarray, b1: np.ndarray, s1: float,
+                     w2: np.ndarray, b2: np.ndarray, s2: float) -> float:
+    best_scale, best_nll = 1.0, float("inf")
+    for scale in LOGIT_SCALE_GRID:
+        logits = forward_quantized(x_val, w1, b1, s1, w2, b2, s2, float(scale))
+        nll = softmax_nll(logits, y_val)
+        if nll < best_nll:
+            best_nll = nll
+            best_scale = float(scale)
+    return best_scale
+
+
+def export_pico_model_json(path: Path, w1_q: np.ndarray, b1: np.ndarray, s1: float,
+                           w2_q: np.ndarray, b2: np.ndarray, s2: float, logit_scale: float) -> None:
+    model_data = {
+        "h_units": HIDDEN_UNITS,
+        "log_s": logit_scale,
+        "w1_s": s1,
+        "w2_s": s2,
+        "w1": w1_q.tolist(),
+        "b1": b1.tolist(),
+        "w2": w2_q.tolist(),
+        "b2": b2.tolist()
+    }
     with path.open("w", encoding="utf-8") as f:
-        f.write("# Auto-generated for Pico 2 deployment\n")
-        f.write(f"# Architecture: 64 -> {HIDDEN_UNITS} -> 10\n")
-        f.write("# Model tuned for center-of-mass shift + deskew preprocessing\n\n")
-        write_vector(f, "SCALER_MEAN", np.round(scaler.mean_, DECIMALS))
-        write_vector(f, "SCALER_SCALE", np.round(scaler.scale_, DECIMALS))
-        write_matrix(f, "WEIGHTS1", np.round(mlp.coefs_[0], DECIMALS).T)
-        write_vector(f, "BIASES1", np.round(mlp.intercepts_[0], DECIMALS))
-        write_matrix(f, "WEIGHTS2", np.round(mlp.coefs_[1], DECIMALS).T)
-        write_vector(f, "BIASES2", np.round(mlp.intercepts_[1], DECIMALS))
+        json.dump(model_data, f, separators=(',', ':'))
 
 
 def main() -> None:
-    digits = load_digits()
-    X = digits.images.astype(float)
-    y = digits.target.astype(int)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    x_train, y_train, x_test, y_test = load_mnist()
+    x_train_full, x_val, y_train_full, y_val = train_test_split(
+        x_train, y_train, test_size=6000, random_state=RANDOM_STATE, stratify=y_train
     )
 
-    X_aug, y_aug = make_augmented(X_train, y_train, n_aug=N_AUG, seed=0)
-    X_test_p = np.array([preprocess(img) for img in X_test])
+    x_train_flat = x_train_full.reshape(len(x_train_full), -1)
+    x_val_flat = x_val.reshape(len(x_val), -1)
+    x_test_flat = x_test.reshape(len(x_test), -1)
 
-    model = make_pipeline(
-        StandardScaler(),
-        MLPClassifier(
-            hidden_layer_sizes=(HIDDEN_UNITS,),
-            activation="tanh",
-            solver="adam",
-            alpha=ALPHA,
-            learning_rate_init=LEARNING_RATE,
-            max_iter=MAX_ITER,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=20,
-            random_state=RANDOM_STATE,
-        ),
-    )
-    model.fit(X_aug.reshape(len(X_aug), -1), y_aug)
+    pca, scaler = fit_pca_and_scaler(x_train_flat)
+    x_train_feat = transform_features(pca, scaler, x_train_flat)
+    
+    model = train_mlp(x_train_feat, y_train_full)
+    
+    # 核心数学融合：将 PCA 矩阵、Scaler 参数与第一层权重完美融合，跳过 Pico 端的特征处理
+    P = pca.components_.T 
+    S = np.diag(1.0 / scaler.scale_)
+    M1 = P @ S 
+    B_pca = - (pca.mean_ @ M1) - (scaler.mean_ / scaler.scale_)
 
-    scaler = model.named_steps["standardscaler"]
-    mlp = model.named_steps["mlpclassifier"]
+    W1_raw = model.coefs_[0]
+    b1_raw = model.intercepts_[0]
 
-    train_acc = accuracy_score(y_aug, model.predict(X_aug.reshape(len(X_aug), -1)))
-    test_acc = accuracy_score(y_test, model.predict(X_test_p.reshape(len(X_test_p), -1)))
+    # 获得可直接处理 784 像素的新权重与偏置！
+    W_fused = M1 @ W1_raw 
+    b_fused = (B_pca @ W1_raw) + b1_raw
 
-    print(f"Train accuracy: {train_acc:.4f}")
-    print(f"Test  accuracy: {test_acc:.4f}")
-    print(f"Iterations: {mlp.n_iter_}")
+    # 对融合后的参数进行量化
+    w1_q, s1 = quantize_matrix(W_fused.T)
+    w2_q, s2 = quantize_matrix(model.coefs_[1].T)
+    b1 = np.asarray(b_fused, dtype=np.float64)
+    b2 = np.asarray(model.intercepts_[1], dtype=np.float64)
 
-    mean = np.round(scaler.mean_, DECIMALS)
-    scale = np.round(scaler.scale_, DECIMALS)
-    W1 = np.round(mlp.coefs_[0], DECIMALS)
-    b1 = np.round(mlp.intercepts_[0], DECIMALS)
-    W2 = np.round(mlp.coefs_[1], DECIMALS)
-    b2 = np.round(mlp.intercepts_[1], DECIMALS)
+    # 注意：此时调参和预测都直接使用扁平化且未经过 PCA 的 784 个原始像素验证其准确性
+    logit_scale = tune_logit_scale(x_val_flat, y_val, w1_q, b1, s1, w2_q, b2, s2)
+    print(f"Selected logit scale: {logit_scale:.4f}")
 
-    Xn = (X_test_p.reshape(len(X_test_p), -1) - mean) / scale
-    hidden = np.tanh(Xn @ W1 + b1)
-    logits = hidden @ W2 + b2
-    pred = logits.argmax(axis=1)
-    rounded_acc = accuracy_score(y_test, pred)
-    exp = np.exp(logits - logits.max(axis=1, keepdims=True))
-    probs = exp / exp.sum(axis=1, keepdims=True)
-    conf = probs.max(axis=1)
-    rounded_correct_conf = float(conf[pred == y_test].mean())
+    q_val_pred = predict_quantized(x_val_flat, w1_q, b1, s1, w2_q, b2, s2, logit_scale)
+    q_test_pred = predict_quantized(x_test_flat, w1_q, b1, s1, w2_q, b2, s2, logit_scale)
+    print(f"Quantized val accuracy:  {accuracy_score(y_val, q_val_pred):.4f}")
+    print(f"Quantized test accuracy: {accuracy_score(y_test, q_test_pred):.4f}")
 
-    print(f"Rounded test accuracy: {rounded_acc:.4f}")
-    print(f"Rounded correct-confidence: {rounded_correct_conf:.4f}")
-
-    out_path = Path(__file__).with_name("pico_model.py")
-    export_model(out_path, scaler, mlp)
-    print(f"Exported: {out_path}")
-    print(f"Export size: {out_path.stat().st_size} bytes")
+    export_pico_model_json(OUTPUT_MODEL, w1_q, b1, s1, w2_q, b2, s2, logit_scale)
+    print(f"Exported Pico JSON model: {OUTPUT_MODEL}")
 
 
 if __name__ == "__main__":
